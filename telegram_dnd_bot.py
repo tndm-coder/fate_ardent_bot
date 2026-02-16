@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -380,6 +381,9 @@ def main() -> None:
     application.add_handler(CommandHandler("Resurrection", resurrection))
 
     LOGGER.info("Starting Telegram bot polling")
+    # Python 3.14+ no longer creates a default event loop for the main thread.
+    # python-telegram-bot still expects one to exist when run_polling starts.
+    asyncio.set_event_loop(asyncio.new_event_loop())
     application.run_polling(close_loop=False)
 
 
