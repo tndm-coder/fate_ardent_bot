@@ -14,6 +14,9 @@ import logging
 import os
 import random
 import asyncio
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -34,6 +37,41 @@ STATE_PATH = Path("telegram_dnd_bot_state.json")
 MAX_HP = 100
 DAILY_LIMIT = 10
 WEEKLY_RESURRECTION_LIMIT = 1
+
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in {"/", "/health", "/healthz"}:
+            payload = b"ok"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def log_message(self, format: str, *args: object) -> None:
+        LOGGER.info("Keep-alive HTTP: " + format, *args)
+
+
+def start_keep_alive_server() -> None:
+    port_value = os.getenv("PORT")
+    if not port_value:
+        LOGGER.info("PORT не задан — keep-alive HTTP сервер отключён")
+        return
+
+    try:
+        port = int(port_value)
+    except ValueError:
+        LOGGER.warning("Некорректный PORT=%r — keep-alive HTTP сервер отключён", port_value)
+        return
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    thread = Thread(target=server.serve_forever, daemon=True, name="keep-alive-http")
+    thread.start()
+    LOGGER.info("Keep-alive HTTP сервер запущен на порту %s", port)
 
 
 DIVINATION_LINES: dict[int, str] = {
@@ -369,6 +407,8 @@ def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN не задан. Пример: export BOT_TOKEN='123:abc'")
+
+    start_keep_alive_server()
 
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
