@@ -1,0 +1,10 @@
+.env
+*.env
+telegram_dnd_bot_state.json
+
+.idea/.gitignore
+.idea/dicebot.iml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml

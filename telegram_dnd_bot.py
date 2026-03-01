@@ -16,6 +16,7 @@ import random
 import asyncio
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib import error, request
 from threading import Thread
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from telegram import Update, User
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from dice_roll import roll_formula
 
@@ -37,6 +38,10 @@ STATE_PATH = Path("telegram_dnd_bot_state.json")
 MAX_HP = 100
 DAILY_LIMIT = 10
 WEEKLY_RESURRECTION_LIMIT = 1
+LLM_CHECK_INTERVAL_SECONDS = 1800
+LLM_REPLY_PROBABILITY = 0.4
+MAX_CONTEXT_MESSAGES = 20
+MAX_PENDING_MESSAGES = 60
 
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -120,21 +125,150 @@ class Target:
 
 def load_state() -> dict[str, Any]:
     if not STATE_PATH.exists():
-        return {"players": {}, "usage": {}}
+        return {"players": {}, "usage": {}, "llm": {"chats": {}}}
 
     try:
         payload = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         LOGGER.warning("Failed to load state, creating new state file")
-        return {"players": {}, "usage": {}}
+        return {"players": {}, "usage": {}, "llm": {"chats": {}}}
 
     payload.setdefault("players", {})
     payload.setdefault("usage", {})
+    llm_payload = payload.setdefault("llm", {})
+    llm_payload.setdefault("chats", {})
     return payload
 
 
 def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def llm_chat_state(state: dict[str, Any], chat_id: int) -> dict[str, Any]:
+    chats = state["llm"]["chats"]
+    chat = chats.setdefault(
+        str(chat_id),
+        {
+            "pending": [],
+            "responded_count": 0,
+            "skipped_count": 0,
+            "last_activity_at": None,
+            "last_reply_at": None,
+        },
+    )
+    chat.setdefault("pending", [])
+    chat.setdefault("responded_count", 0)
+    chat.setdefault("skipped_count", 0)
+    chat.setdefault("last_activity_at", None)
+    chat.setdefault("last_reply_at", None)
+    return chat
+
+
+def trim_pending(chat: dict[str, Any]) -> None:
+    pending = chat.get("pending", [])
+    if len(pending) > MAX_PENDING_MESSAGES:
+        chat["pending"] = pending[-MAX_PENDING_MESSAGES:]
+
+
+def build_llm_prompt(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    context_rows = [f"- {row['author']}: {row['text']}" for row in messages]
+    context_block = "\n".join(context_rows)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Ты Фэйт Ардент — загадочная, дерзкая и дружелюбная тг-провидица. "
+                "Пиши коротко и по делу (1-3 предложения), на русском, без токсичности."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Вот свежие сообщения из чата. Ответь уместной короткой репликой в стиль ролевого бота:\n"
+                f"{context_block}"
+            ),
+        },
+    ]
+
+
+def call_chat_completion(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, str]],
+    timeout: float = 15,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 120,
+        "temperature": 0.9,
+    }
+    request_payload = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        url=base_url,
+        data=request_payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    with request.urlopen(req, timeout=timeout) as response:
+        raw_body = response.read().decode("utf-8")
+    body = json.loads(raw_body)
+    text = body["choices"][0]["message"]["content"].strip()
+    if not text:
+        raise ValueError("LLM вернула пустой ответ")
+    return text
+
+
+async def generate_llm_reply(messages: list[dict[str, str]]) -> tuple[str, str]:
+    prompt_messages = build_llm_prompt(messages)
+
+    providers = []
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+
+    if openrouter_key:
+        providers.append(
+            {
+                "name": "openrouter",
+                "url": "https://openrouter.ai/api/v1/chat/completions",
+                "api_key": openrouter_key,
+                "model": os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            }
+        )
+    if groq_key:
+        providers.append(
+            {
+                "name": "groq",
+                "url": "https://api.groq.com/openai/v1/chat/completions",
+                "api_key": groq_key,
+                "model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            }
+        )
+
+    if not providers:
+        raise RuntimeError("Не заданы OPENROUTER_API_KEY и/или GROQ_API_KEY")
+
+    errors_by_provider: dict[str, str] = {}
+    for provider in providers:
+        try:
+            reply = await asyncio.to_thread(
+                call_chat_completion,
+                base_url=provider["url"],
+                api_key=provider["api_key"],
+                model=provider["model"],
+                messages=prompt_messages,
+            )
+            return reply, provider["name"]
+        except (error.HTTPError, error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            errors_by_provider[provider["name"]] = str(exc)
+
+    raise RuntimeError(f"Все LLM-провайдеры недоступны: {errors_by_provider}")
 
 
 def user_display_name(user: User | None) -> str:
@@ -403,6 +537,70 @@ async def resurrection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if not update.message or not update.effective_chat:
+        return
+
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    state = load_state()
+    chat = llm_chat_state(state, update.effective_chat.id)
+    chat["pending"].append(
+        {
+            "author": user_display_name(update.effective_user),
+            "text": text,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    chat["last_activity_at"] = datetime.now().isoformat(timespec="seconds")
+    trim_pending(chat)
+    save_state(state)
+
+
+async def llm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.application:
+        return
+
+    state = load_state()
+    chats_payload = state.get("llm", {}).get("chats", {})
+    changed = False
+
+    for raw_chat_id, chat in chats_payload.items():
+        pending = list(chat.get("pending", []))
+        if not pending:
+            continue
+
+        changed = True
+        if random.random() >= LLM_REPLY_PROBABILITY:
+            chat["skipped_count"] = int(chat.get("skipped_count", 0)) + 1
+            chat["pending"] = []
+            continue
+
+        context_messages = pending[-MAX_CONTEXT_MESSAGES:]
+        try:
+            reply, provider = await generate_llm_reply(context_messages)
+        except RuntimeError as exc:
+            LOGGER.warning("LLM failed for chat %s: %s", raw_chat_id, exc)
+            continue
+
+        try:
+            await context.application.bot.send_message(chat_id=int(raw_chat_id), text=reply)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to send LLM reply to chat %s: %s", raw_chat_id, exc)
+            continue
+
+        LOGGER.info("LLM replied in chat %s via %s", raw_chat_id, provider)
+        chat["responded_count"] = int(chat.get("responded_count", 0)) + 1
+        chat["last_reply_at"] = datetime.now().isoformat(timespec="seconds")
+        chat["pending"] = []
+
+    if changed:
+        save_state(state)
+
+
 def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -419,6 +617,12 @@ def main() -> None:
     application.add_handler(CommandHandler("heal", heal))
     application.add_handler(CommandHandler("resurrection", resurrection))
     application.add_handler(CommandHandler("Resurrection", resurrection))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message))
+
+    if application.job_queue:
+        application.job_queue.run_repeating(llm_tick, interval=LLM_CHECK_INTERVAL_SECONDS, first=60)
+    else:
+        LOGGER.warning("Job queue is unavailable; LLM periodic replies are disabled")
 
     LOGGER.info("Starting Telegram bot polling")
     # Python 3.14+ no longer creates a default event loop for the main thread.

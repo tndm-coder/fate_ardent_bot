@@ -1,153 +1,16 @@
-diff --git a/telegram_dnd_bot.py b/telegram_dnd_bot.py
-index 6e4e23ccbb7e435bae83b9965a342089c01ed74a..681a3149d5e52bd40043ab3b28611983faaf72c4 100644
---- a/telegram_dnd_bot.py
-+++ b/telegram_dnd_bot.py
-@@ -1,63 +1,101 @@
- """Telegram bot: "Фэйт Ардент, бросающая кубы".
-
- Features:
- - /roll [formula] [var=value ...]
- - /roll Divination -> d20 prophecy mode
- - Persistent HP system for chat participants
- - /dmg <target>, /heal <target>, /resurrection <target>, /hp
- """
-
- from __future__ import annotations
-
- import json
- import logging
- import os
- import random
- import asyncio
-+from http import HTTPStatus
-+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-+from threading import Thread
- from dataclasses import dataclass
- from datetime import date, datetime
- from pathlib import Path
- from typing import Any
-
- from telegram import Update, User
- from telegram.ext import Application, CommandHandler, ContextTypes
-
- from dice_roll import roll_formula
-
- logging.basicConfig(
-     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-     level=logging.INFO,
- )
- LOGGER = logging.getLogger(__name__)
-
- STATE_PATH = Path("telegram_dnd_bot_state.json")
- MAX_HP = 100
- DAILY_LIMIT = 10
- WEEKLY_RESURRECTION_LIMIT = 1
-
-
-+class KeepAliveHandler(BaseHTTPRequestHandler):
-+    def do_GET(self) -> None:  # noqa: N802
-+        if self.path in {"/", "/health", "/healthz"}:
-+            payload = b"ok"
-+            self.send_response(HTTPStatus.OK)
-+            self.send_header("Content-Type", "text/plain; charset=utf-8")
-+            self.send_header("Content-Length", str(len(payload)))
-+            self.end_headers()
-+            self.wfile.write(payload)
-+            return
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9a373858e9cd622152620d03792a8fbac1de5b7
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,10 @@
++# Telegram
++BOT_TOKEN=ТВОЙ_ТЕЛЕГРАМ_БОТ_ТОКЕН
 +
-+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
++# LLM providers (set one or both)
++OPENROUTER_API_KEY=ОПЕН РОУТЕР КЛЮЧ
++GROQ_API_KEY=ГРОК КЛЮЧ
 +
-+    def log_message(self, format: str, *args: object) -> None:
-+        LOGGER.info("Keep-alive HTTP: " + format, *args)
-+
-+
-+def start_keep_alive_server() -> None:
-+    port_value = os.getenv("PORT")
-+    if not port_value:
-+        LOGGER.info("PORT не задан — keep-alive HTTP сервер отключён")
-+        return
-+
-+    try:
-+        port = int(port_value)
-+    except ValueError:
-+        LOGGER.warning("Некорректный PORT=%r — keep-alive HTTP сервер отключён", port_value)
-+        return
-+
-+    server = ThreadingHTTPServer(("0.0.0.0", port), KeepAliveHandler)
-+    thread = Thread(target=server.serve_forever, daemon=True, name="keep-alive-http")
-+    thread.start()
-+    LOGGER.info("Keep-alive HTTP сервер запущен на порту %s", port)
-+
-+
- DIVINATION_LINES: dict[int, str] = {
-     1: "не делай этого — ты буквально умрёшь.",
-     2: "ох-ох, кажется, сегодня не твой день :)",
-     3: "лучше отложи. правда, лучше отложи",
-     4: "идея смелая… и опасная. подготовь резервные планы от b до x",
-     5: "может сработать, если сначала помолиться всем кубическим богам.",
-     6: "шансы скромные, но упрямство иногда творит чудеса.",
-     7: "ну в целом, почти. будет близко, но скорее всего не выйдет",
-     8: "получится, но с тобой произойдет неприятный казус",
-     9: "выпало девять. как думаешь что это значит?",
-     10: "в целом получится, но осторожно: лишний шаг — и будет драма.",
-     11: "средне-хорошо. не легендарно, но достойно.",
-     12: "да, если делать уверенно и без паники.",
-     13: "кубы кивают. пахнет успехом. и шампунем",
-     14: "очень неплохо: фортуна уже поправляет тебе корону, принцесса",
-     15: "да! и красиво. плюс вайб и аура фарминг",
-     16: "отличный знак. я смотрю ты неплоха",
-     17: "почти триумф. главное — не сглазь.",
-     18: "твой момент. делай и сияй. (empty e-hu, e-hu)",
-     19: "великолепно. сегодня ты главный герой этого дерьма.",
-     20: "БОГИ ВСТАЮТ ПЕРЕД ТОБОЙ НА КОЛЕНИ",
- }
-
-
- HELP_TEXT = (
-@@ -348,44 +386,46 @@ async def resurrection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
-         save_state(state)
-         return
-
-     usage = actor_usage(state, actor_id)
-     if usage["resurrection"] >= WEEKLY_RESURRECTION_LIMIT:
-         await update.message.reply_text("⛔ На этой неделе у тебя уже был ритуал воскрешения (1/1).")
-         save_state(state)
-         return
-
-     usage["resurrection"] += 1
-     player = ensure_player(state, target.user_id, target.name)
-     player["hp"] = MAX_HP
-     save_state(state)
-
-     await update.message.reply_text(
-         f"🕊️ Фэйт Ардент возвращает {player['name']} из-за грани.\n"
-         f"Жизнь восстановлена: {MAX_HP} HP."
-     )
-
-
- def main() -> None:
-     token = os.getenv("BOT_TOKEN")
-     if not token:
-         raise RuntimeError("BOT_TOKEN не задан. Пример: export BOT_TOKEN='123:abc'")
-
-+    start_keep_alive_server()
-+
-     application = Application.builder().token(token).build()
-     application.add_handler(CommandHandler("start", start))
-     application.add_handler(CommandHandler("help", help_command))
-     application.add_handler(CommandHandler("roll", roll))
-     application.add_handler(CommandHandler("hp", hp))
-     application.add_handler(CommandHandler("dmg", dmg))
-     application.add_handler(CommandHandler("heal", heal))
-     application.add_handler(CommandHandler("resurrection", resurrection))
-     application.add_handler(CommandHandler("Resurrection", resurrection))
-
-     LOGGER.info("Starting Telegram bot polling")
-     # Python 3.14+ no longer creates a default event loop for the main thread.
-     # python-telegram-bot still expects one to exist when run_polling starts.
-     asyncio.set_event_loop(asyncio.new_event_loop())
-     application.run_polling(close_loop=False)
-
-
- if __name__ == "__main__":
-     main()
++# Optional model overrides
++OPENROUTER_MODEL=openai/gpt-4o-mini
++GROQ_MODEL=llama-3.1-8b-instant
