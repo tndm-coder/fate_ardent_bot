@@ -114,6 +114,7 @@ HELP_TEXT = (
     "• `/heal <ник>` — исцелить на 1d8 (10 зарядов/день)\n"
     "• `/resurrection <ник>` — вернуть к 100 HP (1/неделю)\n"
     "• `/hp` — твои текущие HP"
+    "• `/message [текст]` — вручную вызвать ответ LLM (тест)"
 )
 
 
@@ -601,6 +602,49 @@ async def llm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(state)
 
 
+async def force_llm_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    state = load_state()
+    chat = llm_chat_state(state, update.effective_chat.id)
+    pending = list(chat.get("pending", []))
+    manual_text = " ".join(context.args).strip()
+
+    if manual_text:
+        pending.append(
+            {
+                "author": user_display_name(update.effective_user),
+                "text": manual_text,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+
+    if not pending:
+        pending = [
+            {
+                "author": user_display_name(update.effective_user),
+                "text": "Тест ручного триггера. Дай короткую реплику для чата.",
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+        ]
+
+    context_messages = pending[-MAX_CONTEXT_MESSAGES:]
+    try:
+        reply, provider = await generate_llm_reply(context_messages)
+    except RuntimeError as exc:
+        await update.message.reply_text(f"⚠️ Не удалось получить ответ LLM: {exc}")
+        return
+
+    chat["pending"] = []
+    chat["responded_count"] = int(chat.get("responded_count", 0)) + 1
+    chat["last_reply_at"] = datetime.now().isoformat(timespec="seconds")
+    save_state(state)
+
+    LOGGER.info("Manual LLM trigger in chat %s via %s", update.effective_chat.id, provider)
+    await update.message.reply_text(reply)
+
+
 def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -617,6 +661,7 @@ def main() -> None:
     application.add_handler(CommandHandler("heal", heal))
     application.add_handler(CommandHandler("resurrection", resurrection))
     application.add_handler(CommandHandler("Resurrection", resurrection))
+    application.add_handler(CommandHandler("message", force_llm_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message))
 
     if application.job_queue:

@@ -1,46 +1,158 @@
 diff --git a/telegram_dnd_bot.py b/telegram_dnd_bot.py
-index 0000000..0000000 100644
+index 517400c495425eb4ffb4d2d7c5fbc394b860f2ec..199a653a8e10be9e94acd7e1a115b6ea9d9d91f0 100644
 --- a/telegram_dnd_bot.py
 +++ b/telegram_dnd_bot.py
-@@ -113,7 +113,8 @@ HELP_TEXT = (
+@@ -92,50 +92,51 @@ DIVINATION_LINES: dict[int, str] = {
+     10: "в целом получится, но осторожно: лишний шаг — и будет драма.",
+     11: "средне-хорошо. не легендарно, но достойно.",
+     12: "да, если делать уверенно и без паники.",
+     13: "кубы кивают. пахнет успехом. и шампунем",
+     14: "очень неплохо: фортуна уже поправляет тебе корону, принцесса",
+     15: "да! и красиво. плюс вайб и аура фарминг",
+     16: "отличный знак. я смотрю ты неплоха",
+     17: "почти триумф. главное — не сглазь.",
+     18: "твой момент. делай и сияй. (empty e-hu, e-hu)",
+     19: "великолепно. сегодня ты главный герой этого дерьма.",
+     20: "БОГИ ВСТАЮТ ПЕРЕД ТОБОЙ НА КОЛЕНИ",
+ }
+
+
+ HELP_TEXT = (
+     "Я — *Фэйт Ардент, бросающая кубы* 🔮🎲\n"
+     "Таинственная провидица вашей партии.\n\n"
+     "Команды:\n"
+     "• `/roll` — бросить d20\n"
+     "• `/roll 2d6+3`\n"
+     "• `/roll Divination` — пророчество по d20\n"
      "• `/dmg <ник>` — нанести 1d8 урона (10 зарядов/день)\n"
      "• `/heal <ник>` — исцелить на 1d8 (10 зарядов/день)\n"
      "• `/resurrection <ник>` — вернуть к 100 HP (1/неделю)\n"
--    "• `/hp` — твои текущие HP"
-+    "• `/hp` — твои текущие HP\n"
-+    "• `/message` — вручную триггернуть LLM-ответ по новым сообщениям"
+     "• `/hp` — твои текущие HP"
++    "• `/message [текст]` — вручную вызвать ответ LLM (тест)"
  )
 
-@@ -617,6 +618,25 @@ async def llm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+
+ @dataclass
+ class Target:
+     user_id: str
+     name: str
+
+
+ def load_state() -> dict[str, Any]:
+     if not STATE_PATH.exists():
+         return {"players": {}, "usage": {}, "llm": {"chats": {}}}
+
+     try:
+         payload = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+     except (OSError, json.JSONDecodeError):
+         LOGGER.warning("Failed to load state, creating new state file")
+         return {"players": {}, "usage": {}, "llm": {"chats": {}}}
+
+     payload.setdefault("players", {})
+     payload.setdefault("usage", {})
+     llm_payload = payload.setdefault("llm", {})
+     llm_payload.setdefault("chats", {})
+     return payload
+
+@@ -579,57 +580,101 @@ async def llm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+             chat["pending"] = []
+             continue
+
+         context_messages = pending[-MAX_CONTEXT_MESSAGES:]
+         try:
+             reply, provider = await generate_llm_reply(context_messages)
+         except RuntimeError as exc:
+             LOGGER.warning("LLM failed for chat %s: %s", raw_chat_id, exc)
+             continue
+
+         try:
+             await context.application.bot.send_message(chat_id=int(raw_chat_id), text=reply)
+         except Exception as exc:  # noqa: BLE001
+             LOGGER.warning("Failed to send LLM reply to chat %s: %s", raw_chat_id, exc)
+             continue
+
+         LOGGER.info("LLM replied in chat %s via %s", raw_chat_id, provider)
+         chat["responded_count"] = int(chat.get("responded_count", 0)) + 1
+         chat["last_reply_at"] = datetime.now().isoformat(timespec="seconds")
+         chat["pending"] = []
+
      if changed:
          save_state(state)
 
-+
-+async def message_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-+    if not update.message or not update.effective_chat or not context.application:
+
++async def force_llm_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    if not update.message or not update.effective_chat:
 +        return
 +
 +    state = load_state()
-+    raw_chat_id = str(update.effective_chat.id)
 +    chat = llm_chat_state(state, update.effective_chat.id)
++    pending = list(chat.get("pending", []))
++    manual_text = " ".join(context.args).strip()
 +
-+    changed = await process_chat_llm(
-+        application=context.application,
-+        raw_chat_id=raw_chat_id,
-+        chat=chat,
-+        force=True,
-+    )
-+    if not changed:
-+        await update.message.reply_text("Пока нет новых сообщений для контекста. Напишите что-нибудь в чат и попробуйте снова.")
++    if manual_text:
++        pending.append(
++            {
++                "author": user_display_name(update.effective_user),
++                "text": manual_text,
++                "at": datetime.now().isoformat(timespec="seconds"),
++            }
++        )
++
++    if not pending:
++        pending = [
++            {
++                "author": user_display_name(update.effective_user),
++                "text": "Тест ручного триггера. Дай короткую реплику для чата.",
++                "at": datetime.now().isoformat(timespec="seconds"),
++            }
++        ]
++
++    context_messages = pending[-MAX_CONTEXT_MESSAGES:]
++    try:
++        reply, provider = await generate_llm_reply(context_messages)
++    except RuntimeError as exc:
++        await update.message.reply_text(f"⚠️ Не удалось получить ответ LLM: {exc}")
 +        return
 +
++    chat["pending"] = []
++    chat["responded_count"] = int(chat.get("responded_count", 0)) + 1
++    chat["last_reply_at"] = datetime.now().isoformat(timespec="seconds")
 +    save_state(state)
 +
-
++    LOGGER.info("Manual LLM trigger in chat %s via %s", update.effective_chat.id, provider)
++    await update.message.reply_text(reply)
++
++
  def main() -> None:
-@@ -655,6 +675,7 @@ def main() -> None:
+     token = os.getenv("BOT_TOKEN")
+     if not token:
+         raise RuntimeError("BOT_TOKEN не задан. Пример: export BOT_TOKEN='123:abc'")
+
+     start_keep_alive_server()
+
+     application = Application.builder().token(token).build()
+     application.add_handler(CommandHandler("start", start))
+     application.add_handler(CommandHandler("help", help_command))
+     application.add_handler(CommandHandler("roll", roll))
+     application.add_handler(CommandHandler("hp", hp))
+     application.add_handler(CommandHandler("dmg", dmg))
      application.add_handler(CommandHandler("heal", heal))
      application.add_handler(CommandHandler("resurrection", resurrection))
      application.add_handler(CommandHandler("Resurrection", resurrection))
-+    application.add_handler(CommandHandler("message", message_command))
++    application.add_handler(CommandHandler("message", force_llm_message))
      application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message))
+
+     if application.job_queue:
+         application.job_queue.run_repeating(llm_tick, interval=LLM_CHECK_INTERVAL_SECONDS, first=60)
+     else:
+         LOGGER.warning("Job queue is unavailable; LLM periodic replies are disabled")
+
+     LOGGER.info("Starting Telegram bot polling")
+     # Python 3.14+ no longer creates a default event loop for the main thread.
+     # python-telegram-bot still expects one to exist when run_polling starts.
+     asyncio.set_event_loop(asyncio.new_event_loop())
+     application.run_polling(close_loop=False)
+
+
+ if __name__ == "__main__":
+     main()
