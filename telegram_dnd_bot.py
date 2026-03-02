@@ -43,6 +43,22 @@ LLM_REPLY_PROBABILITY = 0.4
 MAX_CONTEXT_MESSAGES = 20
 MAX_PENDING_MESSAGES = 60
 
+LLM_MODES: dict[str, dict[str, Any]] = {
+    "silent": {
+        "reply_probability": 0.05,
+        "persona": "молчаливая и наблюдательная",
+    },
+    "balanced": {
+        "reply_probability": 0.4,
+        "persona": "загадочная, дерзкая и дружелюбная",
+    },
+    "chaotic": {
+        "reply_probability": 0.8,
+        "persona": "эксцентричная, импульсивная и игривая",
+    },
+}
+DEFAULT_LLM_MODE = "balanced"
+
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
@@ -114,7 +130,9 @@ HELP_TEXT = (
     "• `/heal <ник>` — исцелить на 1d8 (10 зарядов/день)\n"
     "• `/resurrection <ник>` — вернуть к 100 HP (1/неделю)\n"
     "• `/hp` — твои текущие HP"
-    "• `/message [текст]` — вручную вызвать ответ LLM (тест)"
+    "• `/message [текст]` — вручную вызвать ответ LLM (тест)\n"
+    "• `/mode [silent|balanced|chaotic]` — режим автоответов LLM\n"
+    "• `/llm [on|off]` — включить/выключить автоответы LLM"
 )
 
 
@@ -155,6 +173,10 @@ def llm_chat_state(state: dict[str, Any], chat_id: int) -> dict[str, Any]:
             "skipped_count": 0,
             "last_activity_at": None,
             "last_reply_at": None,
+            "enabled": True,
+            "mode": DEFAULT_LLM_MODE,
+            "reply_probability": LLM_MODES[DEFAULT_LLM_MODE]["reply_probability"],
+            "persona": LLM_MODES[DEFAULT_LLM_MODE]["persona"],
         },
     )
     chat.setdefault("pending", [])
@@ -162,6 +184,10 @@ def llm_chat_state(state: dict[str, Any], chat_id: int) -> dict[str, Any]:
     chat.setdefault("skipped_count", 0)
     chat.setdefault("last_activity_at", None)
     chat.setdefault("last_reply_at", None)
+    chat.setdefault("enabled", True)
+    chat.setdefault("mode", DEFAULT_LLM_MODE)
+    chat.setdefault("reply_probability", LLM_MODES[DEFAULT_LLM_MODE]["reply_probability"])
+    chat.setdefault("persona", LLM_MODES[DEFAULT_LLM_MODE]["persona"])
     return chat
 
 
@@ -171,7 +197,7 @@ def trim_pending(chat: dict[str, Any]) -> None:
         chat["pending"] = pending[-MAX_PENDING_MESSAGES:]
 
 
-def build_llm_prompt(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+def build_llm_prompt(messages: list[dict[str, str]], persona: str) -> list[dict[str, str]]:
     context_rows = [f"- {row['author']}: {row['text']}" for row in messages]
     context_block = "\n".join(context_rows)
     return [
@@ -179,6 +205,7 @@ def build_llm_prompt(messages: list[dict[str, str]]) -> list[dict[str, str]]:
             "role": "system",
             "content": (
                 "Ты Фэйт Ардент — загадочная, дерзкая и дружелюбная тг-провидица. "
+                f"Твой текущий стиль: {persona}. "
                 "Пиши коротко и по делу (1-3 предложения), на русском, без токсичности."
             ),
         },
@@ -226,8 +253,8 @@ def call_chat_completion(
     return text
 
 
-async def generate_llm_reply(messages: list[dict[str, str]]) -> tuple[str, str]:
-    prompt_messages = build_llm_prompt(messages)
+async def generate_llm_reply(messages: list[dict[str, str]], persona: str) -> tuple[str, str]:
+    prompt_messages = build_llm_prompt(messages, persona)
 
     providers = []
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
@@ -570,19 +597,26 @@ async def llm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     changed = False
 
     for raw_chat_id, chat in chats_payload.items():
+        if not bool(chat.get("enabled", True)):
+            continue
+
         pending = list(chat.get("pending", []))
         if not pending:
             continue
 
         changed = True
-        if random.random() >= LLM_REPLY_PROBABILITY:
+        reply_probability = float(chat.get("reply_probability", LLM_REPLY_PROBABILITY))
+        if random.random() >= reply_probability:
             chat["skipped_count"] = int(chat.get("skipped_count", 0)) + 1
             chat["pending"] = []
             continue
 
         context_messages = pending[-MAX_CONTEXT_MESSAGES:]
         try:
-            reply, provider = await generate_llm_reply(context_messages)
+            reply, provider = await generate_llm_reply(
+                context_messages,
+                str(chat.get("persona", LLM_MODES[DEFAULT_LLM_MODE]["persona"])),
+            )
         except RuntimeError as exc:
             LOGGER.warning("LLM failed for chat %s: %s", raw_chat_id, exc)
             continue
@@ -631,7 +665,10 @@ async def force_llm_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context_messages = pending[-MAX_CONTEXT_MESSAGES:]
     try:
-        reply, provider = await generate_llm_reply(context_messages)
+        reply, provider = await generate_llm_reply(
+            context_messages,
+            str(chat.get("persona", LLM_MODES[DEFAULT_LLM_MODE]["persona"])),
+        )
     except RuntimeError as exc:
         await update.message.reply_text(f"⚠️ Не удалось получить ответ LLM: {exc}")
         return
@@ -643,6 +680,71 @@ async def force_llm_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     LOGGER.info("Manual LLM trigger in chat %s via %s", update.effective_chat.id, provider)
     await update.message.reply_text(reply)
+
+
+async def llm_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    state = load_state()
+    chat = llm_chat_state(state, update.effective_chat.id)
+
+    if not context.args:
+        current_mode = str(chat.get("mode", DEFAULT_LLM_MODE))
+        current_probability = float(chat.get("reply_probability", LLM_REPLY_PROBABILITY))
+        enabled = "on" if bool(chat.get("enabled", True)) else "off"
+        await update.message.reply_text(
+            "🎭 Текущий режим LLM: "
+            f"{current_mode} (reply_probability={current_probability:.2f}, llm={enabled}).\n"
+            "Доступные режимы: silent, balanced, chaotic"
+        )
+        return
+
+    mode = context.args[0].strip().lower()
+    selected = LLM_MODES.get(mode)
+    if not selected:
+        await update.message.reply_text(
+            "⚠️ Неизвестный режим. Используй: /mode silent, /mode balanced или /mode chaotic"
+        )
+        return
+
+    chat["mode"] = mode
+    chat["reply_probability"] = selected["reply_probability"]
+    chat["persona"] = selected["persona"]
+    save_state(state)
+
+    await update.message.reply_text(
+        "✅ Режим LLM обновлён: "
+        f"{mode} (reply_probability={selected['reply_probability']:.2f})."
+    )
+
+
+async def llm_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    state = load_state()
+    chat = llm_chat_state(state, update.effective_chat.id)
+
+    if not context.args:
+        enabled = bool(chat.get("enabled", True))
+        await update.message.reply_text(
+            f"🤖 Автоответы LLM сейчас {'включены' if enabled else 'выключены'}. Используй /llm on|off"
+        )
+        return
+
+    arg = context.args[0].strip().lower()
+    if arg not in {"on", "off"}:
+        await update.message.reply_text("⚠️ Используй: /llm on или /llm off")
+        return
+
+    chat["enabled"] = arg == "on"
+    if arg == "off":
+        chat["pending"] = []
+    save_state(state)
+    await update.message.reply_text(
+        f"✅ Автоответы LLM {'включены' if chat['enabled'] else 'выключены'}."
+    )
 
 
 def main() -> None:
@@ -662,6 +764,8 @@ def main() -> None:
     application.add_handler(CommandHandler("resurrection", resurrection))
     application.add_handler(CommandHandler("Resurrection", resurrection))
     application.add_handler(CommandHandler("message", force_llm_message))
+    application.add_handler(CommandHandler("mode", llm_mode))
+    application.add_handler(CommandHandler("llm", llm_toggle))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_message))
 
     if application.job_queue:
